@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bilal Restaurant — Digital Menu</title>
+    <meta name="description" content="Explore our menu, food, drinks and prices.">
+    
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    
+    <!-- Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Tailwind CSS (for layout and utility classes) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        serif: ['Playfair Display', 'serif'],
+                    },
+                    colors: {
+                        brand: {
+                            primary: 'var(--color-primary)',
+                            secondary: 'var(--color-secondary)',
+                            bg: '#FAFAFA',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Supabase & QR Code Libs -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+    <style>
+        :root {
+            --color-primary: #1B4332;
+            --color-secondary: #D4AF37;
+        }
+
+        body {
+            background-color: #FAFAFA;
+            color: #212529;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Hide scrollbar for category menu */
+        .hide-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .hide-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+
+        .category-btn.active {
+            background-color: var(--color-primary);
+            color: white;
+            border-color: var(--color-primary);
+        }
+
+        .food-card {
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .food-card:active, .food-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+
+        .modal-overlay {
+            background-color: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(4px);
+        }
+
+        /* Loading Spinner */
+        .spinner {
+            border: 3px solid rgba(0,0,0,0.1);
+            border-radius: 50%;
+            border-top: 3px solid var(--color-primary);
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Admin Layout */
+        .admin-sidebar { min-height: 100vh; }
+        .admin-nav-item.active { background-color: rgba(255,255,255,0.1); border-left: 4px solid var(--color-secondary); }
+    </style>
+</head>
+<body class="font-sans antialiased">
+
+    <!-- App Mount Point -->
+    <div id="app"></div>
+
+    <script>
+        // ==========================================
+        // 1. CONFIGURATION & SETUP
+        // ==========================================
+        
+        // REPLACE THESE WITH YOUR SUPABASE CREDENTIALS
+        const SUPABASE_URL = 'https://YOUR_PROJECT_ID.supabase.co';
+        const SUPABASE_ANON_KEY = 'YOUR_ANON_KEY';
+        
+        const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        // Global State
+        const state = {
+            session: null,
+            currentRoute: '',
+            restaurant: null,
+            categories: [],
+            menuItems: [],
+            filteredItems: [],
+            activeCategory: 'all',
+            searchQuery: '',
+            adminView: 'dashboard',
+            isLoading: true,
+            dashboardStats: {}
+        };
+
+        // DOM Elements
+        const app = document.getElementById('app');
+
+        // ==========================================
+        // 2. ROUTER LOGIC
+        // ==========================================
+        async function router() {
+            const hash = window.location.hash || '#/menu/bilal-restaurant';
+            state.currentRoute = hash;
+            state.isLoading = true;
+            renderLoading();
+
+            if (hash.startsWith('#/menu/')) {
+                const slug = hash.split('/')[2];
+                await loadCustomerMenu(slug);
+            } else if (hash.startsWith('#/admin')) {
+                await checkAuth();
+                if (!state.session) {
+                    renderAdminLogin();
+                } else {
+                    await loadAdminData();
+                    renderAdminDashboard();
+                }
+            } else {
+                window.location.hash = '#/menu/bilal-restaurant';
+            }
+        }
+
+        window.addEventListener('hashchange', router);
+
+        // ==========================================
+        // 3. AUTHENTICATION (ADMIN)
+        // ==========================================
+        async function checkAuth() {
+            const { data: { session } } = await supabaseClient.auth.getSession();
+            state.session = session;
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const email = e.target.email.value;
+            const password = e.target.password.value;
+            const errorEl = document.getElementById('login-error');
+            
+            errorEl.classList.add('hidden');
+            const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+            
+            if (error) {
+                errorEl.textContent = error.message;
+                errorEl.classList.remove('hidden');
+            } else {
+                state.session = data.session;
+                window.location.hash = '#/admin/dashboard';
+            }
+        }
+
+        async function handleLogout() {
+            await supabaseClient.auth.signOut();
+            state.session = null;
+            window.location.hash = '#/admin/login';
+        }
+
+        // ==========================================
+        // 4. DATA FETCHING
+        // ==========================================
+        async function loadCustomerMenu(slug) {
+            try {
+                // Fetch Restaurant
+                const { data: restaurant, error: restErr } = await supabaseClient
+                    .from('restaurants')
+                    .select('*')
+                    .eq('slug', slug)
+                    .single();
+                
+                if (restErr || !restaurant) throw new Error('Restaurant not found');
+                state.restaurant = restaurant;
+                
+                // Update CSS Vars
+                document.documentElement.style.setProperty('--color-primary', restaurant.primary_color || '#1B4332');
+                document.documentElement.style.setProperty('--color-secondary', restaurant.secondary_color || '#D4AF37');
+                document.title = `${restaurant.name} — Menu`;
+
+                // Log View
+                supabaseClient.from('menu_views').insert([{ restaurant_id: restaurant.id, device_type: /Mobi|Android/i.test(navigator.userAgent) ? 'Mobile' : 'Desktop' }]).then();
+
+                // Fetch Categories
+                const { data: categories } = await supabaseClient
+                    .from('categories')
+                    .select('*')
+                    .eq('restaurant_id', restaurant.id)
+                    .eq('is_active', true)
+                    .order('sort_order', { ascending: true });
+                state.categories = categories || [];
+
+                // Fetch Menu Items
+                const { data: items } = await supabaseClient
+                    .from('menu_items')
+                    .select('*')
+                    .eq('restaurant_id', restaurant.id)
+                    .order('sort_order', { ascending: true });
+                state.menuItems = items || [];
+                state.filteredItems = items || [];
+                
+                state.isLoading = false;
+                renderCustomerView();
+            } catch (error) {
+                console.error(error);
+                app.innerHTML = `<div class="h-screen flex items-center justify-center text-center p-4">
+                    <div>
+                        <i class="fas fa-exclamation-triangle text-red-500 text-4xl mb-4"></i>
+                        <h2 class="text-xl font-bold mb-2">Menu Unavailable</h2>
+                        <p class="text-gray-600">Sorry, we couldn't load the menu. Please check the URL or your connection.</p>
+                    </div>
+                </div>`;
+            }
+        }
+
+        async function loadAdminData() {
+            try {
+                // Get admin's profile and restaurant
+                const { data: profile } = await supabaseClient.from('profiles').select('restaurant_id').eq('id', state.session.user.id).single();
+                if (!profile) throw new Error('No profile found');
+
+                const { data: restaurant } = await supabaseClient.from('restaurants').select('*').eq('id', profile.restaurant_id).single();
+                state.restaurant = restaurant;
+
+                // Fetch counts for dashboard
+                const [{ count: itemsCount }, { count: catCount }, { count: viewsCount }] = await Promise.all([
+                    supabaseClient.from('menu_items').select('*', { count: 'exact', head: true }).eq('restaurant_id', restaurant.id),
+                    supabaseClient.from('categories').select('*', { count: 'exact', head: true }).eq('restaurant_id', restaurant.id),
+                    supabaseClient.from('menu_views').select('*', { count: 'exact', head: true }).eq('restaurant_id', restaurant.id)
+                ]);
+
+                state.dashboardStats = { items: itemsCount, categories: catCount, views: viewsCount };
+
+                // Fetch full lists for management
+                const { data: cats } = await supabaseClient.from('categories').select('*').eq('restaurant_id', restaurant.id).order('sort_order');
+                state.categories = cats || [];
+
+                const { data: items } = await supabaseClient.from('menu_items').select('*, categories(name)').eq('restaurant_id', restaurant.id).order('category_id');
+                state.menuItems = items || [];
+
+                state.isLoading = false;
+            } catch (e) {
+                console.error(e);
+                alert("Error loading admin data.");
+            }
+        }
+
+        // ==========================================
+        // 5. CUSTOMER UI RENDERING
+        // ==========================================
+        function renderCustomerView() {
+            const { restaurant, categories, filteredItems, activeCategory } = state;
+            
+            const html = `
+                <!-- Header / Hero -->
+                <header class="bg-brand-primary text-white pt-12 pb-8 px-4 rounded-b-[2rem] shadow-lg relative overflow-hidden">
+                    <div class="absolute inset-0 opacity-10 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')]"></div>
+                    <div class="relative z-10 max-w-3xl mx-auto text-center">
+                        ${restaurant.logo_url ? `<img src="${restaurant.logo_url}" alt="${restaurant.name} Logo" class="w-24 h-24 rounded-full mx-auto mb-4 border-2 border-brand-secondary object-cover shadow-md">` : `<div class="w-20 h-20 rounded-full mx-auto mb-4 border-2 border-brand-secondary flex items-center justify-center text-3xl bg-white text-brand-primary"><i class="fas fa-utensils"></i></div>`}
+                        <h1 class="font-serif text-3xl font-bold mb-2">${restaurant.name}</h1>
+                        <p class="text-sm text-gray-200 mb-4 opacity-90">${restaurant.description || 'Welcome to our menu.'}</p>
+                        <div class="flex justify-center space-x-4 text-xs font-medium text-brand-secondary">
+                            ${restaurant.opening_hours ? `<span><i class="far fa-clock mr-1"></i>${restaurant.opening_hours}</span>` : ''}
+                        </div>
+                    </div>
+                </header>
+
+                <main class="max-w-3xl mx-auto pb-24">
+                    <!-- Search Bar -->
+                    <div class="px-4 -mt-5 relative z-20">
+                        <div class="bg-white rounded-full shadow-md flex items-center px-4 py-3 border border-gray-100">
+                            <i class="fas fa-search text-gray-400 mr-3"></i>
+                            <input type="text" id="searchInput" placeholder="Search menu..." class="w-full outline-none text-sm bg-transparent" onkeyup="handleSearch(event)">
+                        </div>
+                    </div>
+
+                    <!-- Categories Horizontal Scroll -->
+                    <div class="mt-6 px-4">
+                        <div class="flex overflow-x-auto hide-scrollbar space-x-3 pb-2">
+                            <button onclick="filterCategory('all')" class="category-btn ${activeCategory === 'all' ? 'active' : 'bg-white text-gray-600 border border-gray-200'} whitespace-nowrap px-5 py-2 rounded-full text-sm font-medium transition-colors">
+                                All
+                            </button>
+                            ${categories.map(cat => `
+                                <button onclick="filterCategory('${cat.id}')" class="category-btn ${activeCategory === cat.id ? 'active' : 'bg-white text-gray-600 border border-gray-200'} whitespace-nowrap px-5 py-2 rounded-full text-sm font-medium transition-colors">
+                                    ${cat.name}
+                                </button>
+                            `).join('')}
+                        </div>
+                    </div>
+
+                    <!-- Menu Grid -->
+                    <div class="mt-4 px-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        ${filteredItems.length === 0 ? `
+                            <div class="col-span-full text-center py-10 text-gray-500">
+                                <i class="fas fa-box-open text-3xl mb-2 opacity-50"></i>
+                                <p>No items found.</p>
+                            </div>
+                        ` : filteredItems.map(item => `
+                            <div onclick="openItemModal('${item.id}')" class="food-card bg-white rounded-2xl p-3 flex gap-4 cursor-pointer border border-gray-100 shadow-sm ${!item.is_available ? 'opacity-60 grayscale' : ''}">
+                                ${item.image_url ? 
+                                    `<img src="${item.image_url}" loading="lazy" alt="${item.name}" class="w-24 h-24 rounded-xl object-cover">` : 
+                                    `<div class="w-24 h-24 rounded-xl bg-gray-100 flex items-center justify-center text-gray-300"><i class="fas fa-image text-2xl"></i></div>`
+                                }
+                                <div class="flex-1 flex flex-col justify-center">
+                                    <div class="flex justify-between items-start mb-1">
+                                        <h3 class="font-bold text-gray-900">${item.name}</h3>
+                                        ${!item.is_available ? `<span class="text-[10px] bg-red-100 text-red-600 px-2 py-1 rounded font-bold uppercase tracking-wide">Sold Out</span>` : ''}
+                                    </div>
+                                    <p class="text-xs text-gray-500 line-clamp-2 mb-2">${item.description || ''}</p>
+                                    <div class="font-bold text-brand-primary mt-auto">${item.price} <span class="text-xs font-normal text-gray-500">${restaurant.currency}</span></div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+
+                    <!-- Footer Info -->
+                    <div class="mt-12 px-6 py-8 bg-white border-t border-gray-100 text-center rounded-t-3xl">
+                        <h4 class="font-serif font-bold text-xl mb-4">${restaurant.name}</h4>
+                        <p class="text-sm text-gray-600 mb-2"><i class="fas fa-map-marker-alt w-5 text-gray-400"></i> ${restaurant.address || 'Location not provided'}</p>
+                        <p class="text-sm text-gray-600 mb-6"><i class="fas fa-phone w-5 text-gray-400"></i> ${restaurant.phone || 'Phone not provided'}</p>
+                        
+                        <div class="flex justify-center space-x-4">
+                            ${restaurant.facebook_url ? `<a href="${restaurant.facebook_url}" class="w-10 h-10 rounded-full bg-gray-50 flex items-center justify-center text-blue-600"><i class="fab fa-facebook-f"></i></a>` : ''}
+                            ${restaurant.instagram_url ? `<a href="${restaurant.instagram_url}" class="w-10 h-10 rounded-full bg-gray-50 flex items-center justify-center text-pink-600"><i class="fab fa-instagram"></i></a>` : ''}
+                            ${restaurant.telegram_url ? `<a href="${restaurant.telegram_url}" class="w-10 h-10 rounded-full bg-gray-50 flex items-center justify-center text-blue-400"><i class="fab fa-telegram-plane"></i></a>` : ''}
+                        </div>
+                    </div>
+                </main>
+
+                <!-- Floating WhatsApp Button -->
+                ${restaurant.whatsapp ? `
+                    <a href="https://wa.me/${restaurant.whatsapp.replace(/[^0-9]/g, '')}?text=Hello%20${encodeURIComponent(restaurant.name)},%20I%20would%20like%20to%20order..." target="_blank" class="fixed bottom-6 right-6 bg-green-500 text-white w-14 h-14 rounded-full flex items-center justify-center shadow-lg hover:scale-110 transition-transform z-40">
+                        <i class="fab fa-whatsapp text-3xl"></i>
+                    </a>
+                ` : ''}
+
+                <!-- Modal Container -->
+                <div id="itemModal" class="fixed inset-0 z-50 hidden flex items-end md:items-center justify-center px-4 pb-4 md:p-0">
+                    <div class="modal-overlay absolute inset-0" onclick="closeItemModal()"></div>
+                    <div id="modalContent" class="bg-white w-full max-w-md rounded-t-3xl md:rounded-2xl relative z-10 overflow-hidden transform translate-y-full transition-transform duration-300 ease-out flex flex-col max-h-[85vh]">
+                        <!-- Dynamic content goes here -->
+                    </div>
+                </div>
+            `;
+            app.innerHTML = html;
+            
+            // Set search input value if exists
+            const searchInput = document.getElementById('searchInput');
+            if(searchInput && state.searchQuery) {
+                searchInput.value = state.searchQuery;
+            }
+        }
+
+        // ==========================================
+        // 6. CUSTOMER INTERACTIONS
+        // ==========================================
+        function filterCategory(catId) {
+            state.activeCategory = catId;
+            applyFilters();
+        }
+
+        function handleSearch(e) {
+            state.searchQuery = e.target.value.toLowerCase();
+            applyFilters();
+        }
+
+        function applyFilters() {
+            let filtered = state.menuItems;
+            
+            if (state.activeCategory !== 'all') {
+                filtered = filtered.filter(item => item.category_id === state.activeCategory);
+            }
+            
+            if (state.searchQuery) {
+                filtered = filtered.filter(item => 
+                    item.name.toLowerCase().includes(state.searchQuery) || 
+                    (item.description && item.description.toLowerCase().includes(state.searchQuery))
+                );
+            }
+            
+            state.filteredItems = filtered;
+            renderCustomerView(); // Re-render with new state
+        }
+
+        function openItemModal(itemId) {
+            const item = state.menuItems.find(i => i.id === itemId);
+            if (!item) return;
+
+            const modal = document.getElementById('itemModal');
+            const content = document.getElementById('modalContent');
+            
+            content.innerHTML = `
+                <button onclick="closeItemModal()" class="absolute top-4 right-4 w-8 h-8 bg-black bg-opacity-50 rounded-full text-white flex items-center justify-center z-20">
+                    <i class="fas fa-times"></i>
+                </button>
+                ${item.image_url ? `<img src="${item.image_url}" class="w-full h-64 object-cover">` : `<div class="w-full h-40 bg-gray-100 flex items-center justify-center"><i class="fas fa-utensils text-4xl text-gray-300"></i></div>`}
+                <div class="p-6 overflow-y-auto">
+                    <div class="flex justify-between items-start mb-2">
+                        <h2 class="text-2xl font-bold font-serif text-gray-900">${item.name}</h2>
+                    </div>
+                    <p class="text-brand-primary font-bold text-lg mb-4">${item.price} <span class="text-sm text-gray-500">${state.restaurant.currency}</span></p>
+                    <p class="text-gray-600 text-sm leading-relaxed mb-6">${item.description || 'No description available.'}</p>
+                    
+                    ${!item.is_available ? `
+                        <div class="bg-red-50 text-red-600 p-3 rounded-xl text-center font-bold text-sm">Currently Unavailable</div>
+                    ` : (state.restaurant.whatsapp ? `
+                        <a href="https://wa.me/${state.restaurant.whatsapp.replace(/[^0-9]/g, '')}?text=I%20would%20like%20to%20order:%20${encodeURIComponent(item.name)}" target="_blank" class="block w-full bg-brand-primary text-white text-center py-3 rounded-xl font-medium shadow-md">
+                            Order via WhatsApp
+                        </a>
+                    ` : '')}
+                </div>
+            `;
+            
+            modal.classList.remove('hidden');
+            // Trigger animation
+            setTimeout(() => {
+                content.classList.remove('translate-y-full');
+            }, 10);
+        }
+
+        function closeItemModal() {
+            const modal = document.getElementById('itemModal');
+            const content = document.getElementById('modalContent');
+            content.classList.add('translate-y-full');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 300);
+        }
+
+        // ==========================================
+        // 7. ADMIN VIEWS & LOGIC
+        // ==========================================
+        function renderAdminLogin() {
+            app.innerHTML = `
+                <div class="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+                    <div class="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md">
+                        <div class="text-center mb-8">
+                            <h1 class="text-2xl font-bold text-gray-800">Admin Login</h1>
+                            <p class="text-gray-500 text-sm">Sign in to manage your digital menu</p>
+                        </div>
+                        <form onsubmit="handleLogin(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                                <input type="email" name="email" required class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand-primary outline-none">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                                <input type="password" name="password" required class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand-primary outline-none">
+                            </div>
+                            <div id="login-error" class="hidden bg-red-50 text-red-600 text-sm p-3 rounded-lg"></div>
+                            <button type="submit" class="w-full bg-gray-900 text-white py-2.5 rounded-lg font-medium hover:bg-black transition-colors">Sign In</button>
+                        </form>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderAdminDashboard() {
+            const { restaurant, adminView } = state;
+            
+            let mainContent = '';
+            if (adminView === 'dashboard') mainContent = getAdminDashboardHTML();
+            else if (adminView === 'items') mainContent = getAdminItemsHTML();
+            else if (adminView === 'categories') mainContent = getAdminCategoriesHTML();
+            else if (adminView === 'qr') mainContent = getAdminQRHTML();
+
+            app.innerHTML = `
+                <div class="flex h-screen bg-gray-50 overflow-hidden">
+                    <!-- Sidebar -->
+                    <aside class="w-64 bg-gray-900 text-white flex flex-col hidden md:flex">
+                        <div class="p-6">
+                            <h2 class="text-xl font-bold truncate">${restaurant.name}</h2>
+                            <p class="text-xs text-gray-400 mt-1">Admin Panel</p>
+                        </div>
+                        <nav class="flex-1 px-4 space-y-2">
+                            <button onclick="setAdminView('dashboard')" class="admin-nav-item w-full flex items-center px-4 py-3 text-sm rounded-lg ${adminView === 'dashboard' ? 'active' : 'text-gray-300 hover:bg-gray-800'}"><i class="fas fa-home w-6"></i> Dashboard</button>
+                            <button onclick="setAdminView('categories')" class="admin-nav-item w-full flex items-center px-4 py-3 text-sm rounded-lg ${adminView === 'categories' ? 'active' : 'text-gray-300 hover:bg-gray-800'}"><i class="fas fa-list w-6"></i> Categories</button>
+                            <button onclick="setAdminView('items')" class="admin-nav-item w-full flex items-center px-4 py-3 text-sm rounded-lg ${adminView === 'items' ? 'active' : 'text-gray-300 hover:bg-gray-800'}"><i class="fas fa-utensils w-6"></i> Menu Items</button>
+                            <button onclick="setAdminView('qr')" class="admin-nav-item w-full flex items-center px-4 py-3 text-sm rounded-lg ${adminView === 'qr' ? 'active' : 'text-gray-300 hover:bg-gray-800'}"><i class="fas fa-qrcode w-6"></i> QR Code</button>
+                        </nav>
+                        <div class="p-4 border-t border-gray-800">
+                            <button onclick="handleLogout()" class="w-full flex items-center px-4 py-2 text-sm text-gray-400 hover:text-white"><i class="fas fa-sign-out-alt w-6"></i> Logout</button>
+                        </div>
+                    </aside>
+
+                    <!-- Main Content -->
+                    <main class="flex-1 flex flex-col h-screen overflow-y-auto">
+                        <!-- Mobile Header -->
+                        <div class="md:hidden bg-gray-900 text-white p-4 flex justify-between items-center">
+                            <h2 class="font-bold">${restaurant.name}</h2>
+                            <button onclick="document.getElementById('mobileMenu').classList.toggle('hidden')"><i class="fas fa-bars"></i></button>
+                        </div>
+                        <div id="mobileMenu" class="hidden md:hidden bg-gray-800 text-white p-2">
+                             <button onclick="setAdminView('dashboard')" class="block w-full text-left p-3 border-b border-gray-700">Dashboard</button>
+                             <button onclick="setAdminView('categories')" class="block w-full text-left p-3 border-b border-gray-700">Categories</button>
+                             <button onclick="setAdminView('items')" class="block w-full text-left p-3 border-b border-gray-700">Menu Items</button>
+                             <button onclick="setAdminView('qr')" class="block w-full text-left p-3 border-b border-gray-700">QR Code</button>
+                             <button onclick="handleLogout()" class="block w-full text-left p-3 text-red-400">Logout</button>
+                        </div>
+
+                        <div class="p-6 md:p-8 flex-1">
+                            ${mainContent}
+                        </div>
+                    </main>
+                </div>
+            `;
+
+            // Initialize QR code if in QR view
+            if (adminView === 'qr') {
+                generateQR();
+            }
+        }
+
+        function setAdminView(view) {
+            state.adminView = view;
+            renderAdminDashboard();
+        }
+
+        function getAdminDashboardHTML() {
+            const { stats } = state.dashboardStats;
+            return `
+                <div class="mb-6 flex justify-between items-center">
+                    <h1 class="text-2xl font-bold text-gray-900">Dashboard Overview</h1>
+                    <a href="#/menu/${state.restaurant.slug}" target="_blank" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200"><i class="fas fa-external-link-alt mr-2"></i>View Public Menu</a>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex items-center">
+                        <div class="w-12 h-12 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center text-xl mr-4"><i class="fas fa-hamburger"></i></div>
+                        <div><p class="text-sm text-gray-500">Total Items</p><h3 class="text-2xl font-bold">${state.dashboardStats.items || 0}</h3></div>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex items-center">
+                        <div class="w-12 h-12 bg-green-50 text-green-600 rounded-lg flex items-center justify-center text-xl mr-4"><i class="fas fa-list"></i></div>
+                        <div><p class="text-sm text-gray-500">Categories</p><h3 class="text-2xl font-bold">${state.dashboardStats.categories || 0}</h3></div>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex items-center">
+                        <div class="w-12 h-12 bg-purple-50 text-purple-600 rounded-lg flex items-center justify-center text-xl mr-4"><i class="fas fa-eye"></i></div>
+                        <div><p class="text-sm text-gray-500">Menu Views</p><h3 class="text-2xl font-bold">${state.dashboardStats.views || 0}</h3></div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getAdminItemsHTML() {
+            return `
+                <div class="flex justify-between items-center mb-6">
+                    <h1 class="text-2xl font-bold text-gray-900">Menu Items</h1>
+                    <button onclick="openItemForm()" class="bg-gray-900 text-white px-4 py-2 rounded-lg text-sm font-medium"><i class="fas fa-plus mr-2"></i>Add Item</button>
+                </div>
+                <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-gray-50 border-b border-gray-100 text-xs uppercase text-gray-500">
+                                <th class="p-4">Item</th>
+                                <th class="p-4">Category</th>
+                                <th class="p-4">Price</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody class="text-sm divide-y divide-gray-100">
+                            ${state.menuItems.length === 0 ? `<tr><td colspan="5" class="p-6 text-center text-gray-500">No items found.</td></tr>` : 
+                              state.menuItems.map(item => `
+                                <tr class="hover:bg-gray-50">
+                                    <td class="p-4 flex items-center">
+                                        ${item.image_url ? `<img src="${item.image_url}" class="w-10 h-10 rounded-md object-cover mr-3">` : `<div class="w-10 h-10 bg-gray-100 rounded-md mr-3 flex justify-center items-center"><i class="fas fa-image text-gray-300"></i></div>`}
+                                        <span class="font-medium text-gray-900">${item.name}</span>
+                                    </td>
+                                    <td class="p-4 text-gray-600">${item.categories ? item.categories.name : 'Unknown'}</td>
+                                    <td class="p-4 font-medium">${item.price}</td>
+                                    <td class="p-4">
+                                        <span class="px-2 py-1 text-xs rounded-full ${item.is_available ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}">${item.is_available ? 'Available' : 'Sold Out'}</span>
+                                    </td>
+                                    <td class="p-4 text-right">
+                                        <button onclick='openItemForm(${JSON.stringify(item).replace(/'/g, "&#39;")})' class="text-blue-600 hover:text-blue-800 mr-3"><i class="fas fa-edit"></i></button>
+                                        <button onclick="deleteItem('${item.id}')" class="text-red-600 hover:text-red-800"><i class="fas fa-trash"></i></button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Hidden Form Modal -->
+                <div id="adminFormModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center p-4">
+                    <div class="bg-white rounded-xl shadow-xl w-full max-w-lg overflow-hidden">
+                        <div class="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
+                            <h3 id="formTitle" class="text-lg font-bold">Add Item</h3>
+                            <button onclick="closeAdminForm()" class="text-gray-400 hover:text-gray-600"><i class="fas fa-times"></i></button>
+                        </div>
+                        <form id="itemForm" onsubmit="saveItem(event)" class="p-6 space-y-4">
+                            <input type="hidden" id="itemId">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Name</label>
+                                <input type="text" id="itemName" required class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:border-gray-900">
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Price</label>
+                                    <input type="number" id="itemPrice" required class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:border-gray-900">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-1">Category</label>
+                                    <select id="itemCategory" required class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:border-gray-900">
+                                        ${state.categories.map(c => `<option value="${c.id}">${c.name}</option>`).join('')}
+                                    </select>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                                <textarea id="itemDesc" rows="2" class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:border-gray-900"></textarea>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Image Upload (JPG, PNG)</label>
+                                <input type="file" id="itemImage" accept="image/*" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-gray-100 file:text-gray-700 hover:file:bg-gray-200">
+                                <input type="hidden" id="existingImageUrl">
+                            </div>
+                            <div class="flex items-center mt-2">
+                                <input type="checkbox" id="itemAvailable" checked class="w-4 h-4 text-gray-900 border-gray-300 rounded">
+                                <label class="ml-2 text-sm text-gray-700">Item is available</label>
+                            </div>
+                            <div class="pt-4 flex justify-end space-x-3">
+                                <button type="button" onclick="closeAdminForm()" class="px-4 py-2 border border-gray-300 rounded-lg text-gray-700">Cancel</button>
+                                <button type="submit" id="saveBtn" class="px-4 py-2 bg-gray-900 text-white rounded-lg flex items-center">Save Item</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getAdminCategoriesHTML() {
+            return `
+                <div class="flex justify-between items-center mb-6">
+                    <h1 class="text-2xl font-bold text-gray-900">Categories</h1>
+                    <button onclick="openCategoryForm()" class="bg-gray-900 text-white px-4 py-2 rounded-lg text-sm font-medium"><i class="fas fa-plus mr-2"></i>Add Category</button>
+                </div>
+                <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-gray-50 border-b border-gray-100 text-xs uppercase text-gray-500">
+                                <th class="p-4">Name</th>
+                                <th class="p-4">Sort Order</th>
+                                <th class="p-4 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody class="text-sm divide-y divide-gray-100">
+                            ${state.categories.length === 0 ? `<tr><td colspan="3" class="p-6 text-center text-gray-500">No categories found.</td></tr>` : 
+                              state.categories.map(cat => `
+                                <tr class="hover:bg-gray-50">
+                                    <td class="p-4 font-medium text-gray-900">${cat.name}</td>
+                                    <td class="p-4 text-gray-600">${cat.sort_order}</td>
+                                    <td class="p-4 text-right">
+                                        <button onclick="deleteCategory('${cat.id}')" class="text-red-600 hover:text-red-800"><i class="fas fa-trash"></i></button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function getAdminQRHTML() {
+            const menuUrl = window.location.origin + window.location.pathname + '#/menu/' + state.restaurant.slug;
+            return `
+                <div class="max-w-2xl mx-auto text-center mt-10">
+                    <h1 class="text-2xl font-bold text-gray-900 mb-2">Your Menu QR Code</h1>
+                    <p class="text-gray-500 mb-8">Customers can scan this code to view your digital menu instantly.</p>
+                    
+                    <div class="bg-white p-8 rounded-2xl shadow-sm border border-gray-100 inline-block">
+                        <div id="qrcode" class="mb-4"></div>
+                        <p class="text-sm font-mono text-gray-500 break-all mb-4">${menuUrl}</p>
+                        <button onclick="downloadQR()" class="bg-gray-900 text-white px-6 py-2 rounded-lg font-medium shadow hover:bg-black w-full"><i class="fas fa-download mr-2"></i>Download QR Code</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        // ==========================================
+        // 8. ADMIN CRUD OPERATIONS
+        // ==========================================
+        function openItemForm(item = null) {
+            document.getElementById('adminFormModal').classList.remove('hidden');
+            document.getElementById('formTitle').innerText = item ? 'Edit Item' : 'Add Item';
+            
+            if (item) {
+                document.getElementById('itemId').value = item.id;
+                document.getElementById('itemName').value = item.name;
+                document.getElementById('itemPrice').value = item.price;
+                document.getElementById('itemCategory').value = item.category_id;
+                document.getElementById('itemDesc').value = item.description || '';
+                document.getElementById('itemAvailable').checked = item.is_available;
+                document.getElementById('existingImageUrl').value = item.image_url || '';
+            } else {
+                document.getElementById('itemForm').reset();
+                document.getElementById('itemId').value = '';
+                document.getElementById('existingImageUrl').value = '';
+            }
+        }
+
+        function closeAdminForm() {
+            document.getElementById('adminFormModal').classList.add('hidden');
+        }
+
+        async function saveItem(e) {
+            e.preventDefault();
+            const btn = document.getElementById('saveBtn');
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            btn.disabled = true;
+
+            try {
+                const id = document.getElementById('itemId').value;
+                const fileInput = document.getElementById('itemImage');
+                let imageUrl = document.getElementById('existingImageUrl').value;
+
+                // Handle Image Upload
+                if (fileInput.files.length > 0) {
+                    const file = fileInput.files[0];
+                    const fileExt = file.name.split('.').pop();
+                    const fileName = `${Math.random()}.${fileExt}`;
+                    const filePath = `${state.restaurant.id}/${fileName}`;
+
+                    const { error: uploadError } = await supabaseClient.storage.from('menu-images').upload(filePath, file);
+                    if (uploadError) throw uploadError;
+                    
+                    const { data } = supabaseClient.storage.from('menu-images').getPublicUrl(filePath);
+                    imageUrl = data.publicUrl;
+                }
+
+                const itemData = {
+                    restaurant_id: state.restaurant.id,
+                    name: document.getElementById('itemName').value,
+                    price: parseFloat(document.getElementById('itemPrice').value),
+                    category_id: document.getElementById('itemCategory').value,
+                    description: document.getElementById('itemDesc').value,
+                    is_available: document.getElementById('itemAvailable').checked,
+                    image_url: imageUrl
+                };
+
+                if (id) {
+                    await supabaseClient.from('menu_items').update(itemData).eq('id', id);
+                } else {
+                    await supabaseClient.from('menu_items').insert([itemData]);
+                }
+
+                closeAdminForm();
+                await loadAdminData();
+                renderAdminDashboard();
+            } catch (err) {
+                alert('Error saving item: ' + err.message);
+            }
+        }
+
+        async function deleteItem(id) {
+            if(confirm('Are you sure you want to delete this item?')) {
+                await supabaseClient.from('menu_items').delete().eq('id', id);
+                await loadAdminData();
+                renderAdminDashboard();
+            }
+        }
+
+        async function openCategoryForm() {
+            const name = prompt("Enter category name:");
+            if(name) {
+                await supabaseClient.from('categories').insert([{ 
+                    restaurant_id: state.restaurant.id, 
+                    name: name,
+                    sort_order: state.categories.length + 1 
+                }]);
+                await loadAdminData();
+                renderAdminDashboard();
+            }
+        }
+
+        async function deleteCategory(id) {
+            if(confirm('Delete this category? Items inside will be deleted.')) {
+                await supabaseClient.from('categories').delete().eq('id', id);
+                await loadAdminData();
+                renderAdminDashboard();
+            }
+        }
+
+        function generateQR() {
+            const menuUrl = window.location.origin + window.location.pathname + '#/menu/' + state.restaurant.slug;
+            const qrContainer = document.getElementById('qrcode');
+            if(qrContainer) {
+                qrContainer.innerHTML = '';
+                new QRCode(qrContainer, {
+                    text: menuUrl,
+                    width: 200,
+                    height: 200,
+                    colorDark : "#000000",
+                    colorLight : "#ffffff",
+                    correctLevel : QRCode.CorrectLevel.H
+                });
+            }
+        }
+
+        function downloadQR() {
+            const canvas = document.querySelector('#qrcode canvas');
+            if(canvas) {
+                const url = canvas.toDataURL("image/png");
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `QR_${state.restaurant.slug}.png`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }
+        }
+
+        // ==========================================
+        // 9. UTILITIES
+        // ==========================================
+        function renderLoading() {
+            app.innerHTML = `
+                <div class="h-screen w-full flex flex-col items-center justify-center bg-gray-50">
+                    <div class="spinner mb-4"></div>
+                    <p class="text-gray-500 text-sm font-medium">Loading...</p>
+                </div>
+            `;
+        }
+
+        // Initialize App
+        router();
+
+    </script>
+</body>
+</html>
